@@ -24,9 +24,9 @@ static const char *TAG = "line_follower";
 const int SENSOR_WEIGHTS[NUM_LSA_SENSORS] = {-5, -3, 1, 3, 5};
 
 // Motor settings
-const int OPTIMUM_DUTY_CYCLE = 57;
+const int OPTIMUM_DUTY_CYCLE = 58;
 const int LOWER_DUTY_CYCLE = 55;
-const int HIGHER_DUTY_CYCLE = 62;
+const int HIGHER_DUTY_CYCLE = 65;
 
 // PID settings
 #define PID_ERROR_SCALE 10.0
@@ -36,10 +36,14 @@ const int HIGHER_DUTY_CYCLE = 62;
 // Turn & History settings
 #define HISTORY_BUFFER_SIZE 15  // Replaces 'NOR'
 #define U_TURN_HISTORY_THRESHOLD 0.1
-#define U_TURN_DELAY_MS 300
+#define U_TURN_DELAY_MS 50
 
 // End-of-Line detection
-#define REQUIRED_WHITE_COUNT 25 // Consec. readings to confirm end
+#define REQUIRED_WHITE_COUNT_NORMAL 30 // Consec. readings to confirm end
+#define REQUIRED_WHITE_COUNT_PUSHING 1
+#define END_OF_LINE_COOLDOWN_MS 10000 
+
+#define END_ZONE_CORRECTION_DURATION_MS 300
 
 // Pins
 #define IR_SENSOR_PIN GPIO_NUM_0
@@ -47,7 +51,7 @@ const int HIGHER_DUTY_CYCLE = 62;
 // Maneuver settings for box pushing
 #define PUSH_SPEED OPTIMUM_DUTY_CYCLE // Use optimum speed for pushing
 #define REVERSE_SPEED OPTIMUM_DUTY_CYCLE
-#define REVERSE_DURATION_MS 500     // Tune this: 1 second
+#define REVERSE_DURATION_MS 1000     // Tune this: 1 second
 #define UTURN_SPEED HIGHER_DUTY_CYCLE
 #define UTURN_DURATION_MS 500       // Tune this: 1.5 seconds
 
@@ -83,6 +87,9 @@ typedef struct {
     bool far_right_detected;
     bool u_turn_detected;
     bool all_black;
+    bool obstacle_already_pushed;
+    uint32_t end_of_line_disable_until_ms;
+    bool in_end_zone_correction;
     int white_line_count; // Consec. all-white readings
 
     // U-turn history
@@ -105,7 +112,8 @@ static void init_robot_state(RobotState *state);
 // --- Sensor & State Processing ---
 static bool check_obstacle(); // <-- Changed to return bool
 static void process_lsa_readings(line_sensor_array *readings);
-static bool check_end_of_line(line_sensor_array *readings, RobotState *state);
+static bool check_end_of_line(line_sensor_array *readings, RobotState *state, int threshold);
+static bool check_end_zone_correction_needed(line_sensor_array *readings, RobotState *state);
 static void update_robot_state_and_error(line_sensor_array *readings, RobotState *state);
 
 // --- PID & Motor Calculation ---
@@ -161,6 +169,8 @@ static void init_robot_state(RobotState *state) {
     // Zero out the entire structure
     memset(state, 0, sizeof(RobotState));
     // Any non-zero defaults could be set here
+    state->obstacle_already_pushed = false;
+    state->end_of_line_disable_until_ms = 0; // Detection enabled at start
 }
 
 // =========================================================
@@ -195,10 +205,18 @@ static void process_lsa_readings(line_sensor_array *readings) {
  * @brief Checks if all sensors are on white, tracking consecutive counts.
  * @return true if the end of the line is confirmed, false otherwise.
  */
-static bool check_end_of_line(line_sensor_array *readings, RobotState *state) {
+static bool check_end_of_line(line_sensor_array *readings, RobotState *state, int threshold) {
+    uint32_t current_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (current_time_ms < state->end_of_line_disable_until_ms) {
+        // Still in cooldown period - reset counter and return false
+        uint32_t remaining_ms = state->end_of_line_disable_until_ms - current_time_ms;
+        ESP_LOGD(TAG, "End-of-line detection disabled for %lu ms", remaining_ms);
+        state->white_line_count = 0;
+        return false;
+    }
     bool all_white = true;
     for (int i = 0; i < NUM_LSA_SENSORS; i++) {
-        if (readings->adc_reading[i] >= BLACK_BOUNDARY) {
+        if (readings->adc_reading[i] <= BLACK_BOUNDARY) {
             all_white = false;
             break;
         }
@@ -210,7 +228,27 @@ static bool check_end_of_line(line_sensor_array *readings, RobotState *state) {
         state->white_line_count = 0;
     }
 
-    return (state->white_line_count >= REQUIRED_WHITE_COUNT);
+    return (state->white_line_count >= REQUIRED_WHITE_COUNT_NORMAL);
+}
+static bool check_end_zone_correction_needed(line_sensor_array *readings, RobotState *state) {
+    // Only check for correction after obstacle has been pushed (navigating to end zone)
+    if (!state->obstacle_already_pushed) {
+        return false;
+    }
+    
+    // Check if bot is turning left (negative error or far_left_detected)
+    bool turning_left = (state->error < -2.0) || state->far_left_detected;
+    
+    // Check if rightmost sensor (sensor 4) detects white
+    bool rightmost_white = (readings->adc_reading[4] > BLACK_BOUNDARY);
+    
+    // If turning left AND rightmost sensor sees white, we need correction
+    if (turning_left && rightmost_white) {
+        ESP_LOGI(TAG, "End zone correction needed: turning left but rightmost sensor sees white");
+        return true;
+    }
+    
+    return false;
 }
 
 /**
@@ -429,10 +467,41 @@ void line_follow_task(void *arg) {
 
         // --- 2. Process LSA data (always needed) ---
         process_lsa_readings(&readings);
-        bool end_of_line = check_end_of_line(&readings, &state);
+
+        bool end_zone_correction_needed = check_end_zone_correction_needed(&readings, &state);
+        
+        if (end_zone_correction_needed && !state.in_end_zone_correction) {
+            /****************************************
+             * STATE: END ZONE CORRECTION
+             * Bot is turning left at end but rightmost sensor sees white
+             * Immediately move right and stop
+             ****************************************/
+            ESP_LOGI(TAG, "Executing end zone correction: moving right");
+            state.in_end_zone_correction = true;
+            
+            // Move right (left motor forward, right motor slower or backward)
+            set_motor_speed(periph.motor_left, MOTOR_FORWARD, HIGHER_DUTY_CYCLE);
+            set_motor_speed(periph.motor_right, MOTOR_BACKWARD, HIGHER_DUTY_CYCLE);
+            vTaskDelay(END_ZONE_CORRECTION_DURATION_MS / portTICK_PERIOD_MS);
+            
+            // Stop immediately
+            stop_motors(&periph);
+            ESP_LOGI(TAG, "End zone correction complete. Stopping bot.");
+            break; // Exit the while(true) loop
+        }
+
+
+        bool end_of_line;
+        if (obstacle_present && !state.obstacle_already_pushed) {
+            // Use lower threshold when pushing - detect pink square edge faster
+            end_of_line = check_end_of_line(&readings, &state, REQUIRED_WHITE_COUNT_PUSHING);
+        } else {
+            // Use higher threshold for final white stop zone
+            end_of_line = check_end_of_line(&readings, &state, REQUIRED_WHITE_COUNT_NORMAL);
+        }
 
         // --- 3. Main Logic Tree ---
-        if (obstacle_present) {
+        if (obstacle_present && !state.obstacle_already_pushed) {
             /****************************************
              * STATE 1: OBSTACLE DETECTED (PUSHING)
              ****************************************/
@@ -442,7 +511,7 @@ void line_follow_task(void *arg) {
                 
                 // 1. Stop (briefly)
                 stop_motors(&periph);
-                vTaskDelay(150 / portTICK_PERIOD_MS);
+                vTaskDelay(5 / portTICK_PERIOD_MS);
 
                 // 2. Reverse
                 ESP_LOGI(TAG, "Reversing...");
@@ -458,8 +527,18 @@ void line_follow_task(void *arg) {
 
                 // 4. Stop and end task
                 stop_motors(&periph);
-                ESP_LOGI(TAG, "Maneuver complete. Stopping.");
-                break; // Exit the while(true) loop
+                vTaskDelay(50 / portTICK_PERIOD_MS);
+
+                // 6. Set flags and disable end-of-line detection for 10 seconds
+                uint32_t current_time_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                state.end_of_line_disable_until_ms = current_time_ms + END_OF_LINE_COOLDOWN_MS;
+                state.obstacle_already_pushed = true;
+                state.white_line_count = 0;  // Reset counter
+                
+                ESP_LOGI(TAG, "Maneuver complete. End-of-line detection disabled for %d seconds.", 
+                         END_OF_LINE_COOLDOWN_MS / 1000);
+                
+                // Continue to normal maze solving (no break here)
 
             } else {
                 // TASK: STILL PUSHING BOX
