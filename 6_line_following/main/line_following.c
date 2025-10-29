@@ -39,11 +39,9 @@ const int HIGHER_DUTY_CYCLE = 65;
 #define U_TURN_DELAY_MS 50
 
 // End-of-Line detection
-#define REQUIRED_WHITE_COUNT_NORMAL 30 // Consec. readings to confirm end
+#define REQUIRED_WHITE_COUNT_NORMAL 21 // Consec. readings to confirm end
 #define REQUIRED_WHITE_COUNT_PUSHING 1
 #define END_OF_LINE_COOLDOWN_MS 10000 
-
-#define END_ZONE_CORRECTION_DURATION_MS 300
 
 // Pins
 #define IR_SENSOR_PIN GPIO_NUM_0
@@ -89,7 +87,6 @@ typedef struct {
     bool all_black;
     bool obstacle_already_pushed;
     uint32_t end_of_line_disable_until_ms;
-    bool in_end_zone_correction;
     int white_line_count; // Consec. all-white readings
 
     // U-turn history
@@ -113,7 +110,6 @@ static void init_robot_state(RobotState *state);
 static bool check_obstacle(); // <-- Changed to return bool
 static void process_lsa_readings(line_sensor_array *readings);
 static bool check_end_of_line(line_sensor_array *readings, RobotState *state, int threshold);
-static bool check_end_zone_correction_needed(line_sensor_array *readings, RobotState *state);
 static void update_robot_state_and_error(line_sensor_array *readings, RobotState *state);
 
 // --- PID & Motor Calculation ---
@@ -230,27 +226,6 @@ static bool check_end_of_line(line_sensor_array *readings, RobotState *state, in
 
     return (state->white_line_count >= REQUIRED_WHITE_COUNT_NORMAL);
 }
-static bool check_end_zone_correction_needed(line_sensor_array *readings, RobotState *state) {
-    // Only check for correction after obstacle has been pushed (navigating to end zone)
-    if (!state->obstacle_already_pushed) {
-        return false;
-    }
-    
-    // Check if bot is turning left (negative error or far_left_detected)
-    bool turning_left = (state->error < -2.0) || state->far_left_detected;
-    
-    // Check if rightmost sensor (sensor 4) detects white
-    bool rightmost_white = (readings->adc_reading[4] > BLACK_BOUNDARY);
-    
-    // If turning left AND rightmost sensor sees white, we need correction
-    if (turning_left && rightmost_white) {
-        ESP_LOGI(TAG, "End zone correction needed: turning left but rightmost sensor sees white");
-        return true;
-    }
-    
-    return false;
-}
-
 /**
  * @brief Calculates PID error and updates turn flags based on sensor state.
  * (Replaces the old calculate_error() function)
@@ -378,6 +353,7 @@ static void stop_motors(Peripherals *periph) {
  * @brief Executes the motor control logic based on the current robot state.
  */
 static void execute_motor_control(line_sensor_array *readings, RobotState *state, Peripherals *periph) {
+
     // Case 1: Special pattern (1 1 0 1 1) -> Move straight
     if (readings->adc_reading[0] > BLACK_BOUNDARY &&
         readings->adc_reading[1] > BLACK_BOUNDARY &&
@@ -467,29 +443,6 @@ void line_follow_task(void *arg) {
 
         // --- 2. Process LSA data (always needed) ---
         process_lsa_readings(&readings);
-
-        bool end_zone_correction_needed = check_end_zone_correction_needed(&readings, &state);
-        
-        if (end_zone_correction_needed && !state.in_end_zone_correction) {
-            /****************************************
-             * STATE: END ZONE CORRECTION
-             * Bot is turning left at end but rightmost sensor sees white
-             * Immediately move right and stop
-             ****************************************/
-            ESP_LOGI(TAG, "Executing end zone correction: moving right");
-            state.in_end_zone_correction = true;
-            
-            // Move right (left motor forward, right motor slower or backward)
-            set_motor_speed(periph.motor_left, MOTOR_FORWARD, HIGHER_DUTY_CYCLE);
-            set_motor_speed(periph.motor_right, MOTOR_BACKWARD, HIGHER_DUTY_CYCLE);
-            vTaskDelay(END_ZONE_CORRECTION_DURATION_MS / portTICK_PERIOD_MS);
-            
-            // Stop immediately
-            stop_motors(&periph);
-            ESP_LOGI(TAG, "End zone correction complete. Stopping bot.");
-            break; // Exit the while(true) loop
-        }
-
 
         bool end_of_line;
         if (obstacle_present && !state.obstacle_already_pushed) {
@@ -600,3 +553,5 @@ void app_main() {
     xTaskCreate(&line_follow_task, "line_follow_task", 4096, NULL, 1, NULL);
     start_tuning_http_server();
 }
+
+
