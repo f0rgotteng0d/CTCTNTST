@@ -20,7 +20,7 @@ static const char *TAG = "line_follower";
 #define LSA_BLACK_MARGIN 4095
 #define LSA_MAP_LOW 0
 #define LSA_MAP_HIGH 1000
-#define BLACK_BOUNDARY 450 // Threshold for detecting black
+#define BLACK_BOUNDARY 650 // Threshold for detecting black
 const int SENSOR_WEIGHTS[NUM_LSA_SENSORS] = {-5, -3, 1, 3, 5};
 
 // Motor settings
@@ -34,14 +34,15 @@ const int HIGHER_DUTY_CYCLE = 65;
 #define PID_INTEGRAL_MAX 30
 
 // Turn & History settings
-#define HISTORY_BUFFER_SIZE 15  // Replaces 'NOR'
+#define HISTORY_BUFFER_SIZE 30  // Replaces 'NOR'
 #define U_TURN_HISTORY_THRESHOLD 0.1
 #define U_TURN_DELAY_MS 50
 
 // End-of-Line detection
-#define REQUIRED_WHITE_COUNT_NORMAL 21 // Consec. readings to confirm end
+#define REQUIRED_WHITE_COUNT_NORMAL 30 // Consec. readings to confirm end
 #define REQUIRED_WHITE_COUNT_PUSHING 1
-#define END_OF_LINE_COOLDOWN_MS 10000 
+#define END_OF_LINE_COOLDOWN_MS 10000
+#define ALL_WHITE_THRESHOLD 5  
 
 // Pins
 #define IR_SENSOR_PIN GPIO_NUM_0
@@ -88,6 +89,8 @@ typedef struct {
     bool obstacle_already_pushed;
     uint32_t end_of_line_disable_until_ms;
     int white_line_count; // Consec. all-white readings
+    bool all_white_detected;
+    int all_white_count;
 
     // U-turn history
     int left_sensor_history[HISTORY_BUFFER_SIZE];
@@ -195,6 +198,19 @@ static void process_lsa_readings(line_sensor_array *readings) {
         readings->adc_reading[i] = map(readings->adc_reading[i], LSA_WHITE_MARGIN, LSA_BLACK_MARGIN, LSA_MAP_LOW, LSA_MAP_HIGH);
         readings->adc_reading[i] = LSA_MAP_HIGH - readings->adc_reading[i]; // Invert
     }
+}
+
+/**
+ * @brief Checks if all sensors detect white (lost line or gap).
+ * @return true if all sensors are on white, false otherwise.
+ */
+static bool check_all_white(line_sensor_array *readings) {
+    for (int i = 0; i < NUM_LSA_SENSORS; i++) {
+        if (readings->adc_reading[i] <= BLACK_BOUNDARY) {
+            return false;  // At least one sensor sees black
+        }
+    }
+    return true;  // All sensors see white
 }
 
 /**
@@ -444,6 +460,19 @@ void line_follow_task(void *arg) {
         // --- 2. Process LSA data (always needed) ---
         process_lsa_readings(&readings);
 
+        // Check for all-white condition first
+        state.all_white_detected = check_all_white(&readings);
+        bool instant_all_white = check_all_white(&readings);
+
+        if (instant_all_white) {
+            state.all_white_count++;
+        } else {
+            state.all_white_count = 0;  // Reset if not all white
+        }
+
+        // Only set flag if sustained
+        state.all_white_detected = (state.all_white_count >= ALL_WHITE_THRESHOLD);
+
         bool end_of_line;
         if (obstacle_present && !state.obstacle_already_pushed) {
             // Use lower threshold when pushing - detect pink square edge faster
@@ -509,6 +538,16 @@ void line_follow_task(void *arg) {
             ESP_LOGI(TAG, "End of line detected (no obstacle). Stopping bot.");
             break; // Exit the while(true) loop
 
+        } 
+        else if (state.all_white_detected) {
+    /****************************************
+     * STATE 4: ALL WHITE - GO STRAIGHT
+     ****************************************/
+    ESP_LOGI(TAG, "All white detected - moving straight");
+    set_motor_speed(periph.motor_left, MOTOR_FORWARD, OPTIMUM_DUTY_CYCLE);
+    set_motor_speed(periph.motor_right, MOTOR_FORWARD, OPTIMUM_DUTY_CYCLE);
+    
+    // Don't update PID error or history during all-white
         } else {
             /****************************************
              * STATE 3: NORMAL LINE FOLLOWING
@@ -553,5 +592,3 @@ void app_main() {
     xTaskCreate(&line_follow_task, "line_follow_task", 4096, NULL, 1, NULL);
     start_tuning_http_server();
 }
-
-
